@@ -110,6 +110,50 @@ pub trait Host {
     }
     /// Called when a formula's evaluation runs past the stack budget.
     fn stack_exhausted(&mut self) {}
+    /// A defined name's body parsed from its text (`None`: it doesn't parse). Hosts that keep
+    /// the workbook unchanged while evaluating can keep the parse for every later use.
+    fn parsed_name(&mut self, text: &str) -> Option<Arc<ParsedName>> {
+        ParsedName::parse(text).map(Arc::new)
+    }
+}
+
+/// A defined name's body, parsed.
+#[derive(Debug)]
+pub struct ParsedName {
+    pub expr: Expr,
+    /// Whether it holds relative references (they move with the cell that uses the name).
+    pub relative: bool,
+}
+
+impl ParsedName {
+    fn parse(text: &str) -> Option<ParsedName> {
+        let expr = gridcraft_formula::parse_name(text).ok()?;
+        let relative = gridcraft_formula::adjust::has_relative_refs(&expr);
+        Some(ParsedName { expr, relative })
+    }
+}
+
+/// Parsed name bodies by their text: a name used by many formulas is parsed once. For
+/// [`precedents`] it also keeps what names resolved to, so it must not outlive the workbook state
+/// it was used with.
+#[derive(Debug, Default)]
+pub struct NameCache {
+    parsed: std::collections::HashMap<String, Option<Arc<ParsedName>>>,
+    /// Name as written → its precedents, per sheet of the formula using it. (A name's body can't
+    /// hold a structured reference, and its relative references make it dynamic, so the cell of the
+    /// formula using it doesn't matter.)
+    resolved: std::collections::HashMap<usize, std::collections::HashMap<String, Found>>,
+}
+
+impl NameCache {
+    pub fn get(&mut self, text: &str) -> Option<Arc<ParsedName>> {
+        if let Some(p) = self.parsed.get(text) {
+            return p.clone();
+        }
+        let p = ParsedName::parse(text).map(Arc::new);
+        self.parsed.insert(text.to_string(), p.clone());
+        p
+    }
 }
 
 pub struct Evaluator<'h> {
@@ -358,23 +402,25 @@ impl<'h> Evaluator<'h> {
         if let Some(def) = wb.name(bare, scope_sheet) {
             let text = def.formula.clone();
             let scope = def.scope.unwrap_or(self.sheet);
-            return match gridcraft_formula::parse_name(&text) {
-                Ok(expr) => {
+            return match self.host.parsed_name(&text) {
+                Some(p) => {
                     // Relative references in a name are relative to A1: used here, they move by
                     // this cell's offset from it.
-                    let expr = if gridcraft_formula::adjust::has_relative_refs(&expr) {
-                        gridcraft_formula::adjust::shift_relative_wrapping(expr, self.at.row as i64, self.at.col as i64)
+                    let shifted;
+                    let expr = if p.relative {
+                        shifted = gridcraft_formula::adjust::shift_relative_wrapping(p.expr.clone(), self.at.row as i64, self.at.col as i64);
+                        &shifted
                     } else {
-                        expr
+                        &p.expr
                     };
                     let saved = self.sheet;
                     // Unqualified references in a name refer to the scope sheet.
                     self.sheet = scope;
-                    let r = self.eval(&expr);
+                    let r = self.eval(expr);
                     self.sheet = saved;
                     r
                 }
-                Err(_) => err(CellError::Name),
+                None => err(CellError::Name),
             };
         }
         // A table name alone means its data body.
@@ -388,14 +434,23 @@ impl<'h> Evaluator<'h> {
     }
 
     fn structured(&mut self, s: &StructRef) -> Ev {
-        let wb = self.host.workbook();
+        match Self::struct_area(self.host.workbook(), self.sheet, self.at, s) {
+            Ok(a) => Ev::R(vec![a]),
+            Err(x) => err(x),
+        }
+    }
+
+    /// The block a structured reference (`Table1[Price]`, `[@Qty]`) selects, for a formula at `at`
+    /// on `sheet`. [`precedents`] uses it too, so what a formula reads and what it depends on
+    /// can't differ.
+    pub(crate) fn struct_area(wb: &Workbook, sheet: usize, at: CellRef, s: &StructRef) -> Result<Area, CellError> {
         let found = if s.table.is_empty() {
-            wb.sheet(self.sheet).and_then(|sh| sh.tables.iter().position(|t| t.range.contains(self.at)).map(|ti| (self.sheet, ti)))
+            wb.sheet(sheet).and_then(|sh| sh.tables.iter().position(|t| t.range.contains(at)).map(|ti| (sheet, ti)))
         } else {
             wb.table(&s.table)
         };
-        let Some((si, ti)) = found else { return err(CellError::Ref) };
-        let Some(t) = wb.sheet(si).and_then(|sh| sh.tables.get(ti)) else { return err(CellError::Ref) };
+        let Some((si, ti)) = found else { return Err(CellError::Ref) };
+        let Some(t) = wb.sheet(si).and_then(|sh| sh.tables.get(ti)) else { return Err(CellError::Ref) };
         let mut r0 = t.range.start.row;
         let mut r1 = t.range.end.row;
         let data = t.data_range();
@@ -406,14 +461,14 @@ impl<'h> Evaluator<'h> {
                     r0 = d.start.row;
                     r1 = d.end.row;
                 }
-                None => return err(CellError::Ref),
+                None => return Err(CellError::Ref),
             }
         } else if items.contains(&StructItem::ThisRow) {
-            if self.at.row < t.range.start.row || self.at.row > t.range.end.row {
-                return err(CellError::Value);
+            if at.row < t.range.start.row || at.row > t.range.end.row {
+                return Err(CellError::Value);
             }
-            r0 = self.at.row;
-            r1 = self.at.row;
+            r0 = at.row;
+            r1 = at.row;
         } else if !items.contains(&StructItem::All) {
             let has = |i: StructItem| items.contains(&i);
             let hdr = t.header_row.then_some(t.range.start.row);
@@ -427,7 +482,7 @@ impl<'h> Evaluator<'h> {
             if has(StructItem::Headers) {
                 match hdr {
                     Some(h) => add(h, h),
-                    None => return err(CellError::Ref),
+                    None => return Err(CellError::Ref),
                 }
             }
             if has(StructItem::Data)
@@ -438,28 +493,28 @@ impl<'h> Evaluator<'h> {
             if has(StructItem::Totals) {
                 match tot {
                     Some(h) => add(h, h),
-                    None => return err(CellError::Ref),
+                    None => return Err(CellError::Ref),
                 }
             }
             if lo > hi {
-                return err(CellError::Ref);
+                return Err(CellError::Ref);
             }
             r0 = lo;
             r1 = hi;
         }
         let (mut c0, mut c1) = (t.range.start.col, t.range.end.col);
         if let Some(a) = &s.col_start {
-            let Some(i) = t.column_index(a) else { return err(CellError::Ref) };
+            let Some(i) = t.column_index(a) else { return Err(CellError::Ref) };
             c0 = t.range.start.col + i as u32;
             c1 = c0;
             if let Some(b) = &s.col_end {
-                let Some(j) = t.column_index(b) else { return err(CellError::Ref) };
+                let Some(j) = t.column_index(b) else { return Err(CellError::Ref) };
                 let cj = t.range.start.col + j as u32;
                 c0 = c0.min(cj);
                 c1 = c1.max(cj);
             }
         }
-        Ev::R(vec![Area { sheet: si, range: RangeRef::new(CellRef::new(r0, c0), CellRef::new(r1, c1)) }])
+        Ok(Area { sheet: si, range: RangeRef::new(CellRef::new(r0, c0), CellRef::new(r1, c1)) })
     }
 
     fn unary(&mut self, op: UnOp, x: &Expr) -> Ev {
@@ -1917,11 +1972,88 @@ pub fn resized_sum_range(sum: RangeRef, height: u32, width: u32) -> RangeRef {
     RangeRef::new(sum.start, CellRef::new(row, col))
 }
 
-/// Collects the static references of an expression with their sheets resolved; `dynamic` is
-/// set when the formula uses INDIRECT/OFFSET/names/tables whose targets can change.
-pub fn precedents(wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool) {
+/// Defined names a name's body may reach through other names before the formula counts as dynamic.
+const MAX_NAME_DEPTH: usize = 8;
+
+/// What the references of a formula (or of a name used in one) come to.
+#[derive(Clone, Debug, Default)]
+struct Found {
+    areas: Vec<Area>,
+    dynamic: bool,
+    /// Uses a defined name or structured reference.
+    defs: bool,
+}
+
+/// Collects the static references of an expression with their sheets resolved, for a formula at
+/// `at` on `sheet`. A defined name or structured reference counts as what it resolves to now (the
+/// third result is set when the formula has one: it must be collected again when names or tables
+/// change). `dynamic` is set when the formula uses INDIRECT/OFFSET/volatile functions, or a name
+/// whose target can't be known without evaluating it (relative, circular, unknown, nested too deep,
+/// or built from such functions). `names` can be shared by the calls for one workbook state.
+pub fn precedents(wb: &Workbook, sheet: usize, at: CellRef, e: &Expr, names: &mut NameCache) -> (Vec<Area>, bool, bool) {
+    let f = collect(wb, sheet, at, e, names, &mut Vec::new());
+    (f.areas, f.dynamic, f.defs)
+}
+
+/// What a name used in a formula on `sheet` stands for, as `Evaluator::name` finds it. A LET/LAMBDA
+/// variable of this name can't be told from a defined name here: it counts as the defined name, and
+/// as dynamic when there is none.
+fn resolve_name<'w>(
+    wb: &'w Workbook,
+    sheet: usize,
+    at: CellRef,
+    n: &str,
+    names: &mut NameCache,
+    chain: &mut Vec<&'w gridcraft_model::DefinedName>,
+) -> Found {
+    if let Some(f) = names.resolved.get(&sheet).and_then(|m| m.get(n)) {
+        return f.clone();
+    }
+    let (scope_sheet, bare) = match n.split_once('!') {
+        Some((s, b)) => (wb.sheet_index(&gridcraft_core::unquote_sheet(s)), b),
+        None => (Some(sheet), n),
+    };
+    let dynamic = Found { dynamic: true, ..Found::default() };
+    let Some(scope_sheet) = scope_sheet else { return dynamic };
+    let found = match wb.name(bare, scope_sheet) {
+        Some(def) => {
+            if chain.len() >= MAX_NAME_DEPTH || chain.iter().any(|d| std::ptr::eq(*d, def)) {
+                // Depends on where the walk started: not kept.
+                return dynamic;
+            }
+            match names.get(&def.formula) {
+                // Doesn't parse: the formula is #NAME?, whatever the cells hold.
+                None => Found::default(),
+                Some(p) if p.relative => dynamic,
+                Some(p) => {
+                    chain.push(def);
+                    let f = collect(wb, def.scope.unwrap_or(sheet), at, &p.expr, names, chain);
+                    chain.pop();
+                    f
+                }
+            }
+        }
+        None => match wb.table(bare).and_then(|(si, ti)| wb.sheet(si)?.tables.get(ti)?.data_range().map(|d| Area { sheet: si, range: d })) {
+            Some(a) => Found { areas: vec![a], ..Found::default() },
+            None => dynamic,
+        },
+    };
+    names.resolved.entry(sheet).or_default().insert(n.to_string(), found.clone());
+    found
+}
+
+/// [`precedents`], inside the names in `chain` (outermost first).
+fn collect<'w>(
+    wb: &'w Workbook,
+    sheet: usize,
+    at: CellRef,
+    e: &Expr,
+    names: &mut NameCache,
+    chain: &mut Vec<&'w gridcraft_model::DefinedName>,
+) -> Found {
     let mut out = Vec::new();
     let mut dynamic = false;
+    let mut defs = false;
     let push = |out: &mut Vec<Area>, r: &Reference, range: RangeRef| match &r.sheet {
         SheetSel::Current => out.push(Area { sheet, range }),
         SheetSel::Named(n) => {
@@ -1954,13 +2086,25 @@ pub fn precedents(wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool) {
         {
             dynamic = true
         }
-        Expr::Name(_) | Expr::Struct(_) => dynamic = true,
+        Expr::Name(n) => {
+            let f = resolve_name(wb, sheet, at, n, names, chain);
+            defs = true;
+            dynamic |= f.dynamic;
+            out.extend(f.areas);
+        }
+        Expr::Struct(s) => {
+            defs = true;
+            // An error result (no such table or column) reads no cells.
+            if let Ok(a) = Evaluator::struct_area(wb, sheet, at, s) {
+                out.push(a);
+            }
+        }
         Expr::Call(n, _) if gridcraft_functions::lookup(n).is_none() && !is_special(n) => dynamic = true,
         // A range ending in a function's result (`A1:INDEX(B1:B9,n)`) covers the cells between
         // the references inside it, not only those references.
         Expr::Binary(BinOp::Range, a, b) if !matches!((&**a, &**b), (Expr::Ref(_), Expr::Ref(_))) => {
-            let mut inner = precedents(wb, sheet, a).0;
-            inner.extend(precedents(wb, sheet, b).0);
+            let mut inner = collect(wb, sheet, at, a, names, chain).areas;
+            inner.extend(collect(wb, sheet, at, b, names, chain).areas);
             let mut boxes: Vec<Area> = Vec::new();
             for area in inner {
                 match boxes.iter_mut().find(|x| x.sheet == area.sheet) {
@@ -1972,7 +2116,7 @@ pub fn precedents(wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool) {
         }
         _ => {}
     });
-    (out, dynamic)
+    Found { areas: out, dynamic, defs }
 }
 
 fn is_special(n: &str) -> bool {

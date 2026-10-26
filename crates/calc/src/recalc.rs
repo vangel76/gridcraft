@@ -44,7 +44,7 @@ use gridcraft_core::{Array, CellError, CellRef, RangeRef, Value};
 use gridcraft_formula::Expr;
 use gridcraft_model::{CalcMode, Workbook};
 
-use crate::eval::{Area, Evaluator, Host, precedents, stack_position};
+use crate::eval::{Area, Evaluator, Host, NameCache, ParsedName, precedents, stack_position};
 
 pub type Key = (usize, CellRef);
 
@@ -52,6 +52,59 @@ pub type Key = (usize, CellRef);
 struct Node {
     areas: Vec<Area>,
     dynamic: bool,
+    /// Uses a defined name or structured reference, which `areas` holds what it resolved to
+    /// when the node was made (see [`DefsSnapshot`]).
+    defs: bool,
+}
+
+/// What names and structured references resolve through: the defined names and the tables. A
+/// formula's precedents through them are only valid while this is unchanged.
+#[derive(Clone, Debug)]
+struct DefsSnapshot {
+    names: Vec<(String, Option<usize>, String)>,
+    tables: Vec<(usize, String, RangeRef, bool, bool, Vec<String>)>,
+}
+
+impl DefsSnapshot {
+    fn of(wb: &Workbook) -> Self {
+        let names = wb.names.iter().map(|n| (n.name.clone(), n.scope, n.formula.clone())).collect();
+        let tables = wb
+            .sheets
+            .iter()
+            .enumerate()
+            .flat_map(|(si, sh)| {
+                sh.tables
+                    .iter()
+                    .map(move |t| (si, t.name.clone(), t.range, t.header_row, t.totals_row, t.columns.iter().map(|c| c.name.clone()).collect()))
+            })
+            .collect();
+        DefsSnapshot { names, tables }
+    }
+
+    /// Whether `wb` still has these names and tables (without copying them, as `of` does).
+    fn matches(&self, wb: &Workbook) -> bool {
+        if self.names.len() != wb.names.len() || !self.names.iter().zip(&wb.names).all(|(a, n)| a.0 == n.name && a.1 == n.scope && a.2 == n.formula) {
+            return false;
+        }
+        let mut mine = self.tables.iter();
+        for (si, sh) in wb.sheets.iter().enumerate() {
+            for t in &sh.tables {
+                let same = mine.next().is_some_and(|a| {
+                    a.0 == si
+                        && a.1 == t.name
+                        && a.2 == t.range
+                        && a.3 == t.header_row
+                        && a.4 == t.totals_row
+                        && a.5.len() == t.columns.len()
+                        && a.5.iter().zip(&t.columns).all(|(x, c)| *x == c.name)
+                });
+                if !same {
+                    return false;
+                }
+            }
+        }
+        mine.next().is_none()
+    }
 }
 
 /// Ranges wider than this many columns go to the per-sheet wide index instead of per-column ones.
@@ -202,6 +255,8 @@ pub struct Graph {
     /// sheet → row intervals of wider ranges, with their columns: (first, last, dependent)
     wide_deps: HashMap<usize, Intervals<(u32, u32, Key)>>,
     dynamic: HashSet<Key>,
+    /// Formulas that use a defined name or structured reference.
+    defs: HashSet<Key>,
     /// Range indexes changed since the last [`Graph::settle`].
     unsettled_cols: HashSet<(usize, u32)>,
     unsettled_wide: HashSet<usize>,
@@ -256,6 +311,9 @@ impl Graph {
         if node.dynamic {
             self.dynamic.insert(k);
         }
+        if node.defs {
+            self.defs.insert(k);
+        }
         self.nodes.insert(k, node);
     }
 
@@ -283,6 +341,7 @@ impl Graph {
             }
         }
         self.dynamic.remove(&k);
+        self.defs.remove(&k);
     }
 
     /// Tidies the range indexes changed by `insert`/`remove` (queries stay correct without it,
@@ -377,11 +436,13 @@ pub struct Calc {
     /// Cells whose formulas have errors from cycles.
     pub circular: Vec<Key>,
     pub last_recalc_cells: usize,
+    /// The names and tables the graph's precedents were made from (`None`: not yet).
+    defs: Option<DefsSnapshot>,
 }
 
 impl Default for Calc {
     fn default() -> Self {
-        Calc { graph: Graph::default(), rng: 0x9E37_79B9_7F4A_7C15, fixed_now: None, circular: vec![], last_recalc_cells: 0 }
+        Calc { graph: Graph::default(), rng: 0x9E37_79B9_7F4A_7C15, fixed_now: None, circular: vec![], last_recalc_cells: 0, defs: None }
     }
 }
 
@@ -408,6 +469,8 @@ struct PassHost<'a> {
     /// They all need it, so reading one of them while it is calculated is a circular reference,
     /// as reading a formula in progress is.
     waiting: HashSet<Key>,
+    /// Defined names parsed during the pass (the workbook doesn't change while it runs).
+    names: NameCache,
     /// The formulas abandoned since the last suspension.
     abandoned: Vec<Key>,
     /// Other formulas read at [`MAX_NESTED`] levels deep by the evaluations being abandoned. They
@@ -455,6 +518,7 @@ impl<'a> PassHost<'a> {
             depth: 0,
             suspend: None,
             waiting: HashSet::default(),
+            names: NameCache::default(),
             abandoned: Vec::new(),
             also: Vec::new(),
             #[cfg(test)]
@@ -774,6 +838,9 @@ impl Host for PassHost<'_> {
     fn stack_exhausted(&mut self) {
         self.out_of_stack = true;
     }
+    fn parsed_name(&mut self, text: &str) -> Option<std::sync::Arc<ParsedName>> {
+        self.names.get(text)
+    }
     fn spill_range(&mut self, sheet: usize, anchor: CellRef) -> Option<RangeRef> {
         let k = (sheet, anchor);
         if !(self.pending.contains(&k) || self.results.contains_key(&k)) {
@@ -1007,13 +1074,14 @@ impl Calc {
     pub fn rebuild(&mut self, wb: &Workbook) {
         self.graph = Graph::default();
         let mut circ = Vec::new();
+        let mut names = NameCache::default();
         for (si, sheet) in wb.sheets.iter().enumerate() {
             for (c, cell) in sheet.cells.iter() {
                 if let Some(f) = &cell.formula
                     && let Some(e) = f.expr()
                 {
-                    let (areas, dynamic) = precedents(wb, si, &e);
-                    self.graph.insert((si, c), Node { areas, dynamic });
+                    let (areas, dynamic, defs) = precedents(wb, si, c, &e, &mut names);
+                    self.graph.insert((si, c), Node { areas, dynamic, defs });
                     if cell.value == Value::Error(CellError::Circ) {
                         circ.push((si, c));
                     }
@@ -1021,6 +1089,7 @@ impl Calc {
             }
         }
         self.graph.settle();
+        self.defs = Some(DefsSnapshot::of(wb));
         self.circular = if wb.calc.iterative { Vec::new() } else { self.loops_among(&circ) };
     }
 
@@ -1086,12 +1155,13 @@ impl Calc {
     /// Updates the graph for cells whose content changed and recalculates what depends on them.
     pub fn cells_changed(&mut self, wb: &mut Workbook, changed: &[Key]) {
         let mut cleared: Vec<(usize, RangeRef)> = Vec::new();
+        let mut names = NameCache::default();
         for &k in changed {
             let formula = wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.clone());
             match formula.and_then(|f| f.expr()) {
                 Some(e) => {
-                    let (areas, dynamic) = precedents(wb, k.0, &e);
-                    self.graph.insert(k, Node { areas, dynamic });
+                    let (areas, dynamic, defs) = precedents(wb, k.0, k.1, &e, &mut names);
+                    self.graph.insert(k, Node { areas, dynamic, defs });
                 }
                 None => {
                     self.graph.remove(k);
@@ -1121,6 +1191,21 @@ impl Calc {
             return;
         }
         let mut seeds: Vec<Key> = changed.to_vec();
+        // Names or tables changed since the graph was made (a name edited or deleted, a table
+        // resized): what the formulas that use them resolve to has changed. Collect their
+        // precedents again and calculate them, as nothing else says what they depend on.
+        if !self.defs.as_ref().is_some_and(|d| d.matches(wb)) {
+            let users: Vec<Key> = self.graph.defs.iter().copied().collect();
+            for k in users {
+                if let Some(e) = wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.as_ref()).and_then(|f| f.expr_arc()) {
+                    let (areas, dynamic, defs) = precedents(wb, k.0, k.1, &e, &mut names);
+                    self.graph.insert(k, Node { areas, dynamic, defs });
+                    seeds.push(k);
+                }
+            }
+            self.graph.settle();
+            self.defs = Some(DefsSnapshot::of(wb));
+        }
         let mut emptied: Vec<Key> = Vec::new();
         // Typing into (or clearing) a cell a dynamic array spills over (or would spill over)
         // re-evaluates the anchor, which may now be blocked or unblocked.
